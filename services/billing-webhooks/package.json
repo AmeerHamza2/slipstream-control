@@ -1,0 +1,31 @@
+{
+  "name": "billing-webhooks",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Slipstream billing webhooks: Stripe, App Store Server Notifications v2 and Google Play RTDN to entitlements",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "dev": "tsx watch src/main.ts",
+    "test": "node --import tsx --test --test-concurrency=1 'test/**/*.test.ts'",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "loadtest": "npm run build && tsx scripts/loadtest.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.12.5",
+    "ioredis": "^5.11.1",
+    "jose": "^6.2.12"
+  },
+  "devDependencies": {
+    "@peculiar/x509": "^2.1.0",
+    "@types/node": "^22.20.5",
+    "reflect-metadata": "^0.2.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
