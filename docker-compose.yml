@@ -1,0 +1,102 @@
+# Full Slipstream control plane on one machine.
+#
+#   make env            # generates .env with fresh dev secrets (once)
+#   make apple-root     # downloads Apple Root CA G3 for App Store JWS verification
+#   docker compose up --build
+#
+# Two simulated VPN nodes (fake-node-1/2) sit on fixed IPs so the operator can
+# register them with the admin API and the prober can measure them.
+name: slipstream
+
+x-secrets: &secrets
+  env_file: .env
+
+networks:
+  slipstream:
+    ipam:
+      config: [{ subnet: 172.28.0.0/24 }]
+
+volumes:
+  pgdata:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: slipstream
+      POSTGRES_PASSWORD: slipstream
+      POSTGRES_DB: slipstream
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U slipstream"]
+      interval: 3s
+      retries: 20
+    networks: [slipstream]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+    networks: [slipstream]
+
+  api:
+    build: { context: ., dockerfile: Dockerfile.api }
+    <<: *secrets
+    environment:
+      DATABASE_URL: postgres://slipstream:slipstream@postgres:5432/slipstream?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      LISTEN_ADDR: ":8080"
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    networks: [slipstream]
+
+  billing-webhooks:
+    build: ./services/billing-webhooks
+    <<: *secrets
+    environment:
+      API_URL: http://api:8080
+      REDIS_URL: redis://redis:6379/1
+      APPLE_ROOT_CA_PATH: /etc/slipstream/AppleRootCA-G3.cer
+      PORT: "8081"
+    volumes: ["./deploy/AppleRootCA-G3.cer:/etc/slipstream/AppleRootCA-G3.cer:ro"]
+    ports: ["8081:8081"]
+    depends_on: [api, redis]
+    # The service drains in-flight webhooks for up to SHUTDOWN_TIMEOUT_MS (15 s); Docker's
+    # default 10 s would SIGKILL it mid-forward.
+    stop_grace_period: 20s
+    networks: [slipstream]
+
+  fleet-prober:
+    build: ./services/fleet-prober
+    <<: *secrets
+    environment:
+      API_URL: http://api:8080
+      PROBER_ID: prober-compose-1
+      PROBE_INTERVAL_S: "15"
+      # Split a large fleet across replicas: give each its own PROBER_ID and PROBER_SHARD=i/N.
+      PROBER_SHARD: "0/1"
+    ports: ["9101:9101"]
+    depends_on: [api]
+    # ~7 sockets per concurrently probed server (PROBE_CONCURRENCY=256 -> ~1,800 fds).
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    # The in-flight cycle gets up to 10 s to finish and post on SIGTERM.
+    stop_grace_period: 20s
+    networks: [slipstream]
+
+  fake-node-1:
+    image: python:3.13-slim
+    command: ["python", "/app/fake_node.py", "--host", "0.0.0.0", "--wg-port", "51820", "--ss-port", "8443", "--load", "0.30", "--delay-ms", "8"]
+    volumes: ["./services/fleet-prober/tools/fake_node.py:/app/fake_node.py:ro"]
+    networks: { slipstream: { ipv4_address: 172.28.0.10 } }
+
+  fake-node-2:
+    image: python:3.13-slim
+    command: ["python", "/app/fake_node.py", "--host", "0.0.0.0", "--wg-port", "51820", "--ss-port", "8443", "--load", "0.75", "--delay-ms", "35", "--drop", "0.2"]
+    volumes: ["./services/fleet-prober/tools/fake_node.py:/app/fake_node.py:ro"]
+    networks: { slipstream: { ipv4_address: 172.28.0.11 } }
