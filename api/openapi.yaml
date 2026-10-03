@@ -1,0 +1,650 @@
+openapi: 3.1.0
+info:
+  title: Slipstream Control API
+  version: 1.0.0
+  summary: Control plane for Slipstream VPN (accounts, devices, WireGuard IPAM, server selection, config issuance, entitlements).
+  description: |
+    Conventions: JSON with snake_case fields, RFC 3339 UTC timestamps, UUIDv4 ids.
+    Every response carries `X-Request-Id` (echoed from the request when it is a
+    safe token of at most 128 characters, otherwise generated). Errors use the
+    `Error` envelope.
+
+    Rate limits (Redis sliding window): signup/login 10/min per client IP plus
+    5/min per email hash; refresh 120/min per client IP; every authenticated
+    `/v1` endpoint 120/min per user. A 429 carries `Retry-After`. If Redis is
+    unavailable, signup/login/refresh fail closed (503) and everything else
+    fails open (counted in `slipstream_ratelimit_fail_open_total`).
+
+    Transient failures are 503 + `Retry-After`, never 500: Postgres unreachable
+    or timing out (every endpoint that touches it), password-hashing capacity
+    saturated (signup/login shed load instead of queueing), tunnel address pool
+    exhausted. Clients should retry with backoff; counted in
+    `slipstream_requests_shed_total{reason}`.
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: auth
+  - name: account
+  - name: devices
+  - name: servers
+  - name: admin
+  - name: internal
+  - name: ops
+
+components:
+  securitySchemes:
+    userJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        EdDSA (Ed25519) access token, 15 min TTL, `kid` header. Claims: iss=slipstream-control,
+        aud=slipstream-app, sub=<user_id>, exp, iat, jti, sid (refresh family id). Keys at /.well-known/jwks.json.
+    adminToken:
+      type: http
+      scheme: bearer
+      description: Static `ADMIN_TOKEN`.
+    serviceHMAC:
+      type: apiKey
+      in: header
+      name: X-Slipstream-Signature
+      description: |
+        HMAC-SHA256 service signing. Headers: `X-Slipstream-Service` (billing-webhooks | fleet-prober),
+        `X-Slipstream-Timestamp` (unix seconds, within 300 s of server time) and
+        `X-Slipstream-Signature: v1=<hex(HMAC_SHA256(secret, timestamp + "." + METHOD + "." + path + "." + body))>`,
+        where `path` excludes the query string. Each endpoint accepts only its designated caller (403 otherwise).
+
+  parameters:
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema: { type: string, maxLength: 128, pattern: '^[A-Za-z0-9._:-]+$' }
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ServerId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  headers:
+    X-Request-Id:
+      schema: { type: string }
+    Retry-After:
+      schema: { type: integer, minimum: 1 }
+      description: Seconds to wait before retrying.
+    ETag:
+      schema: { type: string }
+      description: Entity tag of the body; send it back as `If-None-Match` to get a 304 when nothing changed.
+    X-Sync-Token:
+      schema: { type: string }
+      description: |
+        Opaque token for the next incremental sync (`?since=`). A paginated walk reports the token of its
+        first page on every page.
+    X-Next-Cursor:
+      schema: { type: string }
+      description: Opaque cursor of the next page; absent on the last page.
+    Link:
+      schema: { type: string }
+      description: RFC 8288 `<...>; rel="next"` link to the next page; absent on the last page.
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              enum: [invalid_request, unauthorized, forbidden, not_found, conflict, rate_limited, payment_required, internal]
+            message: { type: string }
+            request_id: { type: string }
+    Credentials:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 12, maxLength: 1024, description: 'min 12 characters on signup' }
+    SignupResponse:
+      type: object
+      required: [user_id]
+      properties:
+        user_id: { type: string, format: uuid }
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token: { type: string, description: EdDSA JWT }
+        refresh_token: { type: string, description: 'opaque, 32 random bytes base64url; rotates on every use' }
+        expires_in: { type: integer, example: 900 }
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string, maxLength: 128 }
+    Entitlement:
+      type: object
+      required: [active, expires_at, source]
+      properties:
+        active: { type: boolean }
+        expires_at: { type: [string, 'null'], format: date-time }
+        source: { type: [string, 'null'], enum: [stripe, app_store, google_play, null] }
+    Me:
+      type: object
+      required: [user_id, email, plan, entitlement, devices_used, devices_limit]
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        plan: { type: string, enum: [free, premium] }
+        entitlement: { $ref: '#/components/schemas/Entitlement' }
+        devices_used: { type: integer }
+        devices_limit: { type: integer, description: 'free = 0, premium = 5' }
+    PublicServer:
+      type: object
+      required: [id, name, country, city, protocols, load, healthy]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: fra-01 }
+        country: { type: string, pattern: '^[A-Z]{2}$', example: DE }
+        city: { type: string, example: Frankfurt }
+        protocols:
+          type: array
+          items: { type: string, enum: [wireguard, shadowsocks] }
+        load: { type: [number, 'null'], minimum: 0, maximum: 1 }
+        healthy: { type: boolean }
+    DeviceCreate:
+      type: object
+      additionalProperties: false
+      required: [name, platform, wg_public_key]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 64 }
+        platform: { type: string, enum: [android, ios] }
+        wg_public_key: { type: string, description: 'standard base64 of a 32-byte Curve25519 public key', minLength: 44, maxLength: 44 }
+    DeviceCreated:
+      type: object
+      required: [device_id, tunnel_address]
+      properties:
+        device_id: { type: string, format: uuid }
+        tunnel_address: { type: string, example: 10.64.0.7/32 }
+    Device:
+      type: object
+      required: [device_id, name, platform, wg_public_key, tunnel_address, created_at]
+      properties:
+        device_id: { type: string, format: uuid }
+        name: { type: string }
+        platform: { type: string, enum: [android, ios] }
+        wg_public_key: { type: string }
+        tunnel_address: { type: string, example: 10.64.0.7/32 }
+        created_at: { type: string, format: date-time }
+    ConfigRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        country: { type: string, pattern: '^[A-Za-z]{2}$', description: 'ISO 3166-1 alpha-2; falls back to all countries if none is healthy there' }
+    WireGuardEntry:
+      type: object
+      required: [name, protocol, endpoint, public_key, preshared_key, keepalive_seconds]
+      properties:
+        name: { type: string, example: fra-01 }
+        protocol: { const: wireguard }
+        endpoint: { type: string, example: '203.0.113.10:51820' }
+        public_key: { type: string }
+        preshared_key: { type: string, description: per (device, server), generated on first issuance }
+        keepalive_seconds: { type: integer, example: 25 }
+    ShadowsocksEntry:
+      type: object
+      required: [name, protocol, endpoint, method, password]
+      properties:
+        name: { type: string, example: fra-01-ss }
+        protocol: { const: shadowsocks }
+        endpoint: { type: string, example: '203.0.113.10:8443' }
+        method: { const: chacha20-ietf-poly1305 }
+        password: { type: string, description: 'base64std(HMAC_SHA256(ss_master_secret, "ss-user:" + user_id)), 44 chars' }
+    TunnelConfig:
+      type: object
+      description: |
+        TunnelCore configuration (minus the client private key). The top 3 healthy servers by
+        `rtt_ms_p50 + 400*load + 200*loss` (ascending), each as a WireGuard entry followed by its
+        Shadowsocks fallback.
+      required: [servers, tunnel_addresses, dns_servers, mtu]
+      properties:
+        servers:
+          type: array
+          maxItems: 6
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/WireGuardEntry'
+              - $ref: '#/components/schemas/ShadowsocksEntry'
+        tunnel_addresses:
+          type: array
+          items: { type: string, example: 10.64.0.7/32 }
+        dns_servers:
+          type: array
+          items: { type: string, example: 10.64.0.1 }
+        mtu: { type: integer, example: 1420 }
+    AdminServerCreate:
+      type: object
+      additionalProperties: false
+      required: [name, country, city, public_ipv4, wg_port, wg_public_key, ss_port]
+      properties:
+        name: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$' }
+        country: { type: string, pattern: '^[A-Za-z]{2}$' }
+        city: { type: string, maxLength: 64 }
+        public_ipv4: { type: string, format: ipv4 }
+        wg_port: { type: integer, minimum: 1, maximum: 65534, description: 'wg_port+1 is the UDP echo health port' }
+        wg_public_key: { type: string }
+        ss_port: { type: integer, minimum: 1, maximum: 65535 }
+        ss_master_secret: { type: string, minLength: 16, maxLength: 256, description: generated (32 random bytes, base64) if absent }
+    AdminServer:
+      type: object
+      required: [id, name, country, city, public_ipv4, wg_port, wg_public_key, ss_port, ss_master_secret, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        country: { type: string }
+        city: { type: string }
+        public_ipv4: { type: string, format: ipv4 }
+        wg_port: { type: integer }
+        wg_public_key: { type: string }
+        ss_port: { type: integer }
+        ss_master_secret: { type: string, description: 'returned only in this response; stored AES-256-GCM encrypted' }
+        created_at: { type: string, format: date-time }
+    Peer:
+      type: object
+      required: [device_id, wg_public_key, tunnel_address, preshared_key]
+      properties:
+        device_id: { type: string, format: uuid }
+        wg_public_key: { type: string }
+        tunnel_address: { type: string, example: 10.64.0.7/32 }
+        preshared_key: { type: string }
+    PeerChanges:
+      type: object
+      description: |
+        Incremental sync result. Apply `upserts` first, then `removals`. Both are idempotent: a change
+        may be repeated in a later sync, and a removal may name a peer the agent does not have.
+      required: [upserts, removals, sync_token]
+      properties:
+        upserts: { type: array, items: { $ref: '#/components/schemas/Peer' } }
+        removals: { type: array, items: { type: string, format: uuid }, description: device ids to remove }
+        sync_token: { type: string, description: 'pass as `since` next time (also in X-Sync-Token)' }
+    InternalServer:
+      type: object
+      required: [id, name, public_ipv4, wg_port, ss_port]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        public_ipv4: { type: string, format: ipv4 }
+        wg_port: { type: integer }
+        ss_port: { type: integer }
+    HeartbeatBatch:
+      type: object
+      required: [prober_id, observed_at, results]
+      properties:
+        prober_id: { type: string, maxLength: 128 }
+        observed_at: { type: string, format: date-time }
+        results:
+          type: array
+          maxItems: 5000
+          items:
+            type: object
+            required: [server_id, reachable]
+            properties:
+              server_id: { type: string, format: uuid }
+              reachable: { type: boolean }
+              rtt_ms_p50: { type: [number, 'null'], minimum: 0 }
+              rtt_ms_p95: { type: [number, 'null'], minimum: 0 }
+              loss: { type: [number, 'null'], minimum: 0, maximum: 1 }
+              load: { type: [number, 'null'], minimum: 0, maximum: 1, description: 'null = unknown, last value kept' }
+    HeartbeatAccepted:
+      type: object
+      required: [accepted]
+      properties:
+        accepted: { type: integer, description: results applied to known servers (unknown ids are ignored) }
+    EntitlementEvent:
+      type: object
+      required: [event_id, source, user_id, product_id, status, original_transaction_id, occurred_at]
+      properties:
+        event_id: { type: string, maxLength: 255 }
+        source: { type: string, enum: [stripe, app_store, google_play] }
+        user_id: { type: string, format: uuid }
+        product_id: { type: string, example: premium_monthly }
+        status: { type: string, enum: [active, grace, expired, revoked, refunded] }
+        expires_at: { type: [string, 'null'], format: date-time, description: required for active and grace }
+        original_transaction_id: { type: string, maxLength: 255 }
+        occurred_at: { type: string, format: date-time }
+    EntitlementResult:
+      type: object
+      required: [applied]
+      properties:
+        applied: { type: boolean }
+        reason: { type: string, enum: [duplicate, stale] }
+    Status:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        checks:
+          type: object
+          additionalProperties: { type: string, enum: [ok, unavailable] }
+    JWKS:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            required: [kty, crv, x, kid]
+            properties:
+              kty: { const: OKP }
+              crv: { const: Ed25519 }
+              x: { type: string, description: base64url public key }
+              kid: { type: string, description: RFC 7638 thumbprint }
+              use: { const: sig }
+              alg: { const: EdDSA }
+
+  responses:
+    BadRequest:
+      description: Invalid request (also 413 when the body exceeds the limit).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: Missing or invalid credentials.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Authenticated but not allowed.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: Not found (also used for resources owned by another user).
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: Conflict.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    PaymentRequired:
+      description: An active premium entitlement is required.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    RateLimited:
+      description: Rate limit exceeded.
+      headers: { Retry-After: { $ref: '#/components/headers/Retry-After' } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unavailable:
+      description: |
+        Temporarily unavailable; retry after `Retry-After` seconds. Causes: Postgres unreachable or slow,
+        rate limiter (Redis) down on auth endpoints, password-hashing capacity saturated, no healthy servers
+        (config), tunnel address pool exhausted (device registration). Code `internal`.
+      headers: { Retry-After: { $ref: '#/components/headers/Retry-After' } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Internal:
+      description: Internal error.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+paths:
+  /v1/auth/signup:
+    post:
+      tags: [auth]
+      operationId: signup
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Credentials' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/SignupResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Credentials' } } } }
+      responses:
+        '200': { description: Token pair (new refresh family), content: { application/json: { schema: { $ref: '#/components/schemas/TokenPair' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refresh
+      description: Rotates the refresh token. Presenting an already-rotated token revokes the whole family (401).
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RefreshRequest' } } } }
+      responses:
+        '200': { description: New token pair, content: { application/json: { schema: { $ref: '#/components/schemas/TokenPair' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      description: Revokes the refresh family of the presented access token (its `sid` claim). The access token itself expires naturally (<= 15 min).
+      security: [{ userJWT: [] }]
+      responses:
+        '204': { description: Revoked }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/me:
+    get:
+      tags: [account]
+      operationId: getMe
+      security: [{ userJWT: [] }]
+      responses:
+        '200': { description: Account, content: { application/json: { schema: { $ref: '#/components/schemas/Me' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/servers:
+    get:
+      tags: [servers]
+      operationId: listServers
+      description: |
+        Served from a per-replica snapshot refreshed at most every few seconds (`SERVER_CACHE_TTL`, default 2 s);
+        `healthy` already applies the 90 s silence rule. Supports `If-None-Match` (304) and
+        `Accept-Encoding: gzip`.
+      security: [{ userJWT: [] }]
+      parameters:
+        - { name: If-None-Match, in: header, required: false, schema: { type: string } }
+      responses:
+        '200':
+          description: Public server list (no secrets).
+          headers: { ETag: { $ref: '#/components/headers/ETag' } }
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/PublicServer' } } } }
+        '304': { description: Not modified since the ETag in If-None-Match, headers: { ETag: { $ref: '#/components/headers/ETag' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/devices:
+    post:
+      tags: [devices]
+      operationId: createDevice
+      description: |
+        Registers a device and allocates a unique /32 from 10.64.0.0/10.
+        Free plan (0 devices) gets 402 `payment_required`; premium at its limit of 5 gets 403 `forbidden`.
+      security: [{ userJWT: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DeviceCreate' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/DeviceCreated' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    get:
+      tags: [devices]
+      operationId: listDevices
+      security: [{ userJWT: [] }]
+      responses:
+        '200': { description: Devices, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Device' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/devices/{id}:
+    delete:
+      tags: [devices]
+      operationId: deleteDevice
+      security: [{ userJWT: [] }]
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+      responses:
+        '204': { description: Deleted; the tunnel address and preshared keys are freed }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/devices/{id}/config:
+    post:
+      tags: [devices]
+      operationId: issueConfig
+      security: [{ userJWT: [] }]
+      parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ConfigRequest' } } } }
+      responses:
+        '200':
+          description: 'TunnelCore config, sent with Cache-Control no-store.'
+          content: { application/json: { schema: { $ref: '#/components/schemas/TunnelConfig' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PaymentRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /admin/v1/servers:
+    post:
+      tags: [admin]
+      operationId: adminCreateServer
+      security: [{ adminToken: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdminServerCreate' } } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/AdminServer' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /admin/v1/servers/{id}/peers:
+    get:
+      tags: [admin]
+      operationId: adminServerPeers
+      description: |
+        WireGuard peers for a node agent. Only devices issued a config for this server whose owner is
+        currently entitled. Three modes:
+
+        - **No query parameters**: every peer as one array (the original behaviour; fine for small nodes).
+        - **`limit` and/or `cursor`**: one page of the same array, keyset-paginated in a stable order
+          (O(log n + limit) per page at any depth). Follow `X-Next-Cursor` (or `Link: rel="next"`) until it
+          is absent. A page may be shorter than `limit` when many owners have lapsed; only a missing cursor
+          means the end.
+        - **`since`**: only what changed since a previous `X-Sync-Token`, as `PeerChanges` (new peers,
+          renewals, lapses including expiry by time, deleted devices/accounts). Tokens older than ~24 h get
+          410: do a full sync.
+
+        Recommended agent loop: a paginated full sync at start-up (keep the `X-Sync-Token`), then
+        `?since=<token>` every 15-30 s, and a full sync again on 410.
+      security: [{ adminToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ServerId' }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 10000, default: 1000 }, description: 'page size (default 1000 when `cursor` is given without `limit`)' }
+        - { name: cursor, in: query, required: false, schema: { type: string }, description: 'opaque, from X-Next-Cursor' }
+        - { name: since, in: query, required: false, schema: { type: string }, description: 'opaque, from X-Sync-Token; cannot be combined with limit/cursor' }
+      responses:
+        '200':
+          description: Peers (array) or, with `since`, the changes.
+          headers:
+            X-Sync-Token: { $ref: '#/components/headers/X-Sync-Token' }
+            X-Next-Cursor: { $ref: '#/components/headers/X-Next-Cursor' }
+            Link: { $ref: '#/components/headers/Link' }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { type: array, items: { $ref: '#/components/schemas/Peer' } }
+                  - { $ref: '#/components/schemas/PeerChanges' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: The sync token is older than the change retention (~24 h); do a full sync. Code `invalid_request`.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /internal/v1/servers:
+    get:
+      tags: [internal]
+      operationId: internalListServers
+      description: 'Caller: fleet-prober.'
+      security: [{ serviceHMAC: [] }]
+      responses:
+        '200': { description: Servers to probe, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/InternalServer' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /internal/v1/servers/heartbeats:
+    post:
+      tags: [internal]
+      operationId: internalHeartbeats
+      description: |
+        Caller: fleet-prober. Unhealthy after 3 consecutive unreachable results or 90 s without a
+        heartbeat (evaluated at read time); healthy again after 2 consecutive reachable results.
+      security: [{ serviceHMAC: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/HeartbeatBatch' } } } }
+      responses:
+        '202': { description: Accepted, content: { application/json: { schema: { $ref: '#/components/schemas/HeartbeatAccepted' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /internal/v1/entitlements:
+    post:
+      tags: [internal]
+      operationId: internalEntitlementEvent
+      description: |
+        Caller: billing-webhooks. Idempotent on `event_id`. Events older than the latest applied one for the
+        same (source, original_transaction_id) are `stale` and ignored.
+      security: [{ serviceHMAC: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/EntitlementEvent' } } } }
+      responses:
+        '200': { description: Processed, content: { application/json: { schema: { $ref: '#/components/schemas/EntitlementResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /.well-known/jwks.json:
+    get:
+      tags: [ops]
+      operationId: jwks
+      responses:
+        '200': { description: 'Public signing keys (cache 5 min)', content: { application/json: { schema: { $ref: '#/components/schemas/JWKS' } } } }
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: healthz
+      responses:
+        '200': { description: Alive, content: { application/json: { schema: { $ref: '#/components/schemas/Status' } } } }
+  /readyz:
+    get:
+      tags: [ops]
+      operationId: readyz
+      responses:
+        '200': { description: Postgres and Redis reachable, content: { application/json: { schema: { $ref: '#/components/schemas/Status' } } } }
+        '503': { description: A dependency is unreachable, content: { application/json: { schema: { $ref: '#/components/schemas/Status' } } } }
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      responses:
+        '200': { description: Prometheus text exposition, content: { text/plain: { schema: { type: string } } } }
+  /openapi.yaml:
+    get:
+      tags: [ops]
+      operationId: openapi
+      responses:
+        '200': { description: This document, content: { application/yaml: { schema: { type: string } } } }
