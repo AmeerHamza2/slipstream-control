@@ -1,0 +1,5 @@
+[
+  {"id": "8f6b2c1e-4a8d-4f1b-9c3e-1d2a3b4c5d01", "name": "fra-01", "public_ipv4": "127.0.0.2", "wg_port": 51820, "ss_port": 8443},
+  {"id": "8f6b2c1e-4a8d-4f1b-9c3e-1d2a3b4c5d02", "name": "ams-01", "public_ipv4": "127.0.0.3", "wg_port": 51820, "ss_port": 8443},
+  {"id": "8f6b2c1e-4a8d-4f1b-9c3e-1d2a3b4c5d03", "name": "lon-01", "public_ipv4": "127.0.0.4", "wg_port": 51820, "ss_port": 8443}
+]
