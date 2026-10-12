@@ -23,3 +23,23 @@ The inter-service contract is in [CONTRACT.md](CONTRACT.md), and scale and capac
 - Migrations are embedded and transactional under an advisory lock, so several replicas can start at once.
 - Webhooks are acknowledged to the store only after the api accepted the event, so failures are redelivered. The billing service retries with exponential backoff and jitter.
 - The api shuts down gracefully, and has `/healthz` and `/readyz` (DB + Redis) and Prometheus metrics in every service.
+
+## Node agent
+
+- **The api is the gatekeeper; nodes enforce.** There is nothing in the data path between a phone
+  and a node: the WireGuard handshake goes straight to the node. Access is controlled by which peers
+  each node accepts, and the agent keeps that list equal to "devices issued this node whose owner is
+  entitled right now".
+- **Incremental sync** every 15 s (`?since=`), so a lapsed user loses access within one interval,
+  and a 100k-peer node pays milliseconds per sync, not a full download.
+- **Fails static.** If the api is unreachable the agent changes nothing. An api incident must not
+  become a VPN outage for every connected user.
+- **Owns the interface.** A periodic full sync removes peers the api doesn't list (added by hand,
+  left over from a crash) and repairs changed preshared keys.
+- **Least privilege.** Each agent holds a token derived for its own server id; it can read that
+  node's peers and nothing else. Rotating `NODE_AGENT_SECRET` revokes all of them.
+- **Secrets hygiene.** Preshared keys reach `wg(8)` as 0600 files in a 0700 directory (a tmpfs in
+  the container), never on the command line where `/proc` would expose them. Logs carry only a
+  short public-key prefix.
+- **Health endpoints.** The UDP echo port answers only datagrams ≤ 64 bytes at the same size, so it
+  can't be used for amplification.

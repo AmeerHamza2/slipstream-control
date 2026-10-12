@@ -122,6 +122,14 @@ Returns exactly the TunnelCore contract (see the tunnelcore README), minus the p
 |---|---|---|
 | GET | `/admin/v1/servers/{id}/peers` | what a node agent pulls to configure WireGuard: `[{device_id, wg_public_key, tunnel_address, preshared_key}]`. Optional `?limit=N&cursor=C` (keyset pages, default 1000, max 10000, next page in `X-Next-Cursor` / `Link`) and `?since=T` (incremental sync, see below) |
 
+| POST | `/admin/v1/servers/{id}/agent-token` | re-issue the node-scoped agent token: `{server_id, agent_token}`; 409 if `NODE_AGENT_SECRET` is unset |
+
+**Node tokens.** The peers endpoint also accepts a token scoped to that one server:
+`nat1.` + base64url(HMAC-SHA256(`NODE_AGENT_SECRET`, `"node-agent:v1:" + server_id`)). It is derived,
+never stored; it is returned in the server-creation response (`agent_token`) and by the endpoint above.
+A node token cannot read another node's peers or call any other admin route, so a compromised node
+exposes only its own peer list. Rotating `NODE_AGENT_SECRET` revokes every node token at once.
+
 ### Node agent peer sync
 A busy node has 100k+ peers, so agents should not re-download the full list every interval:
 
@@ -136,6 +144,12 @@ A busy node has 100k+ peers, so agents should not re-download the full list ever
 3. A token older than ~24 h (removal retention) gets `410`: do a full sync.
 
 Without query parameters the endpoint returns the whole array exactly as before.
+
+`cmd/node-agent` implements this loop. It reconciles the WireGuard interface to the api's list
+(removing peers it does not list), applies changes with `wg set` (preshared keys via 0600 files, never
+on the command line), and **fails static**: if the api is unreachable it changes nothing on the
+interface. It also serves the node's health endpoints: UDP echo on `wg_port + 1` (datagrams ≤ 64 bytes,
+echoed at the same size, so it cannot amplify) and HTTP `/load`, `/healthz`, `/metrics`.
 Tokens and cursors are opaque strings and are only valid against the same deployment.
 
 ## Internal API (api, `/internal/v1`), HMAC service auth
