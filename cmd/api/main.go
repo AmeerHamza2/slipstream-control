@@ -109,14 +109,15 @@ func run(migrate, migrateOnly bool) error {
 			svcauth.ServiceBilling: []byte(cfg.BillingSecret),
 			svcauth.ServiceProber:  []byte(cfg.ProberSecret),
 		}),
-		AdminToken:     cfg.AdminToken,
-		Metrics:        metrics.NewApp(),
-		Logger:         log,
-		TrustedProxies: cfg.TrustedProxies,
-		Limits:         httpapi.DefaultLimits,
-		OpenAPI:        api.OpenAPI,
-		ServerCacheTTL: cacheTTL(cfg.ServerCacheTTL),
-		RequestTimeout: cfg.RequestTimeout,
+		AdminToken:      cfg.AdminToken,
+		NodeAgentSecret: cfg.NodeAgentSecret,
+		Metrics:         metrics.NewApp(),
+		Logger:          log,
+		TrustedProxies:  cfg.TrustedProxies,
+		Limits:          httpapi.DefaultLimits,
+		OpenAPI:         api.OpenAPI,
+		ServerCacheTTL:  cacheTTL(cfg.ServerCacheTTL),
+		RequestTimeout:  cfg.RequestTimeout,
 	})
 
 	httpSrv := &http.Server{

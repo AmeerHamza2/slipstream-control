@@ -101,16 +101,19 @@ type adminServerReq struct {
 }
 
 type adminServerResp struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`
-	Country        string    `json:"country"`
-	City           string    `json:"city"`
-	PublicIPv4     string    `json:"public_ipv4"`
-	WGPort         int       `json:"wg_port"`
-	WGPublicKey    string    `json:"wg_public_key"`
-	SSPort         int       `json:"ss_port"`
-	SSMasterSecret string    `json:"ss_master_secret"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Country        string `json:"country"`
+	City           string `json:"city"`
+	PublicIPv4     string `json:"public_ipv4"`
+	WGPort         int    `json:"wg_port"`
+	WGPublicKey    string `json:"wg_public_key"`
+	SSPort         int    `json:"ss_port"`
+	SSMasterSecret string `json:"ss_master_secret"`
+	// AgentToken is the node-scoped token for this server's agent, present
+	// when NODE_AGENT_SECRET is configured.
+	AgentToken string    `json:"agent_token,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 func validatePublicIPv4(s string) (string, bool) {
@@ -177,9 +180,13 @@ func (s *Server) createServer(w http.ResponseWriter, r *http.Request, req adminS
 	// The master secret is returned once, here, so the operator can
 	// provision the node; it is only stored encrypted.
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusCreated, adminServerResp{ID: sv.ID, Name: sv.Name, Country: sv.Country, City: sv.City,
+	resp := adminServerResp{ID: sv.ID, Name: sv.Name, Country: sv.Country, City: sv.City,
 		PublicIPv4: sv.PublicIPv4, WGPort: sv.WGPort, WGPublicKey: sv.WGPublicKey, SSPort: sv.SSPort,
-		SSMasterSecret: req.SSMasterSecret, CreatedAt: sv.CreatedAt.UTC()})
+		SSMasterSecret: req.SSMasterSecret, CreatedAt: sv.CreatedAt.UTC()}
+	if s.nodeAgentSecret != "" {
+		resp.AgentToken = nodeToken(s.nodeAgentSecret, sv.ID)
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 type peerView struct {

@@ -39,20 +39,22 @@ const (
 
 // Deps are the server's collaborators.
 type Deps struct {
-	Store          *store.Store
-	Redis          redis.UniversalClient
-	Limiter        ratelimit.Limiter
-	Tokens         *auth.TokenIssuer
-	Hasher         *auth.Hasher
-	Keyring        *crypto.Keyring
-	ServiceAuth    *svcauth.Verifier
-	AdminToken     string
-	Metrics        *metrics.App
-	Logger         *slog.Logger
-	TrustedProxies []netip.Prefix
-	Limits         Limits
-	OpenAPI        []byte
-	Now            func() time.Time
+	Store       *store.Store
+	Redis       redis.UniversalClient
+	Limiter     ratelimit.Limiter
+	Tokens      *auth.TokenIssuer
+	Hasher      *auth.Hasher
+	Keyring     *crypto.Keyring
+	ServiceAuth *svcauth.Verifier
+	AdminToken  string
+	// NodeAgentSecret derives per-node agent tokens (optional; see nodetoken.go).
+	NodeAgentSecret string
+	Metrics         *metrics.App
+	Logger          *slog.Logger
+	TrustedProxies  []netip.Prefix
+	Limits          Limits
+	OpenAPI         []byte
+	Now             func() time.Time
 	// ServerCacheTTL is the lifetime of the in-process server list snapshot
 	// (0 = default 2 s, negative = disabled).
 	ServerCacheTTL time.Duration
@@ -69,24 +71,25 @@ const (
 
 // Server is the HTTP API.
 type Server struct {
-	store          *store.Store
-	redis          redis.UniversalClient
-	limiter        ratelimit.Limiter
-	tokens         *auth.TokenIssuer
-	hasher         *auth.Hasher
-	keyring        *crypto.Keyring
-	svc            *svcauth.Verifier
-	adminToken     string
-	metrics        *metrics.App
-	log            *slog.Logger
-	trustedProxies []netip.Prefix
-	limits         Limits
-	openapi        []byte
-	jwks           []byte
-	now            func() time.Time
-	servers        *serverCache
-	reqTimeout     time.Duration
-	draining       atomic.Bool
+	store           *store.Store
+	redis           redis.UniversalClient
+	limiter         ratelimit.Limiter
+	tokens          *auth.TokenIssuer
+	hasher          *auth.Hasher
+	keyring         *crypto.Keyring
+	svc             *svcauth.Verifier
+	adminToken      string
+	nodeAgentSecret string
+	metrics         *metrics.App
+	log             *slog.Logger
+	trustedProxies  []netip.Prefix
+	limits          Limits
+	openapi         []byte
+	jwks            []byte
+	now             func() time.Time
+	servers         *serverCache
+	reqTimeout      time.Duration
+	draining        atomic.Bool
 
 	mux     *http.ServeMux
 	handler http.Handler
@@ -96,7 +99,7 @@ type Server struct {
 func New(d Deps) *Server {
 	s := &Server{
 		store: d.Store, redis: d.Redis, limiter: d.Limiter, tokens: d.Tokens, hasher: d.Hasher, keyring: d.Keyring,
-		svc: d.ServiceAuth, adminToken: d.AdminToken, metrics: d.Metrics, log: d.Logger, trustedProxies: d.TrustedProxies,
+		svc: d.ServiceAuth, adminToken: d.AdminToken, nodeAgentSecret: d.NodeAgentSecret, metrics: d.Metrics, log: d.Logger, trustedProxies: d.TrustedProxies,
 		limits: d.Limits, openapi: d.OpenAPI, now: d.Now, mux: http.NewServeMux(),
 	}
 	if s.now == nil {
@@ -179,7 +182,8 @@ func (s *Server) routes() {
 	// Admin.
 	admin := []mw{s.requireAdmin, body(maxBodyDefault)}
 	s.handle("POST /admin/v1/servers", s.handleAdminCreateServer, admin...)
-	s.handle("GET /admin/v1/servers/{id}/peers", s.handleAdminPeers, admin...)
+	s.handle("GET /admin/v1/servers/{id}/peers", s.handleAdminPeers, s.requireAdminOrNode, body(maxBodyDefault))
+	s.handle("POST /admin/v1/servers/{id}/agent-token", s.handleAdminAgentToken, admin...)
 
 	// Internal, HMAC-signed service calls.
 	s.handle("GET /internal/v1/servers", s.handleInternalServers, body(maxBodyDefault), s.requireService(svcauth.ServiceProber))

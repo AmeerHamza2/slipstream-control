@@ -44,6 +44,13 @@ components:
       type: http
       scheme: bearer
       description: Static `ADMIN_TOKEN`.
+    nodeToken:
+      type: http
+      scheme: bearer
+      description: |
+        Node agent token, scoped to one server: `nat1.` + base64url(HMAC-SHA256(NODE_AGENT_SECRET,
+        "node-agent:v1:" + server_id)). Derived, never stored; accepted only on that server's peers
+        endpoint. Returned when a server is created, or re-issued by POST /admin/v1/servers/{id}/agent-token.
     serviceHMAC:
       type: apiKey
       in: header
@@ -257,6 +264,7 @@ components:
         wg_public_key: { type: string }
         ss_port: { type: integer }
         ss_master_secret: { type: string, description: 'returned only in this response; stored AES-256-GCM encrypted' }
+        agent_token: { type: string, description: 'node-scoped token for this server''s node agent; present when NODE_AGENT_SECRET is configured' }
         created_at: { type: string, format: date-time }
     Peer:
       type: object
@@ -547,8 +555,11 @@ paths:
           410: do a full sync.
 
         Recommended agent loop: a paginated full sync at start-up (keep the `X-Sync-Token`), then
-        `?since=<token>` every 15-30 s, and a full sync again on 410.
-      security: [{ adminToken: [] }]
+        `?since=<token>` every 15-30 s, and a full sync again on 410. `cmd/node-agent` implements it.
+
+        Accepts the admin token or the node token **for this server only**: a compromised node cannot
+        read any other node's peers.
+      security: [{ adminToken: [] }, { nodeToken: [] }]
       parameters:
         - { $ref: '#/components/parameters/ServerId' }
         - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 10000, default: 1000 }, description: 'page size (default 1000 when `cursor` is given without `limit`)' }
@@ -574,6 +585,31 @@ paths:
           description: The sync token is older than the change retention (~24 h); do a full sync. Code `invalid_request`.
           content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
         '503': { $ref: '#/components/responses/Unavailable' }
+
+  /admin/v1/servers/{id}/agent-token:
+    post:
+      tags: [admin]
+      operationId: adminServerAgentToken
+      description: Re-issue the node-scoped token for a server's agent (derived, so it is the same token every time until NODE_AGENT_SECRET rotates).
+      security: [{ adminToken: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ServerId' }
+      responses:
+        '200':
+          description: The token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [server_id, agent_token]
+                properties:
+                  server_id: { type: string, format: uuid }
+                  agent_token: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: NODE_AGENT_SECRET is not configured. Code `conflict`.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
 
   /internal/v1/servers:
     get:

@@ -18,6 +18,7 @@
 #   ADMIN_TOKEN              bearer token for /admin/v1 (>= 32 chars)
 #   BILLING_SERVICE_SECRET   HMAC secret shared with billing-webhooks (>= 32 chars)
 #   PROBER_SERVICE_SECRET    HMAC secret shared with fleet-prober (>= 32 chars, != billing)
+#   NODE_AGENT_SECRET        optional, derives per-node agent tokens (>= 32 chars)
 #   TRUSTED_PROXY_CIDRS      optional, comma-separated CIDRs whose X-Forwarded-For is honoured
 #   LOG_LEVEL                debug | info | warn | error (default info)
 #   SHUTDOWN_TIMEOUT         graceful shutdown budget, Go duration (default 20s)
@@ -34,8 +35,11 @@ DATA_ENCRYPTION_KEY=$(_rand_b64 32)
 ADMIN_TOKEN=$(_rand_hex 32)
 BILLING_SERVICE_SECRET=$(_rand_hex 32)
 PROBER_SERVICE_SECRET=$(_rand_hex 32)
+NODE_AGENT_SECRET=$(_rand_hex 32)
 SECRETS
 fi
+# Secrets files made before node-agent tokens existed get the new key appended.
+grep -q '^NODE_AGENT_SECRET=' "$_secrets_file" || echo "NODE_AGENT_SECRET=$(_rand_hex 32)" >>"$_secrets_file"
 set -a
 # shellcheck disable=SC1090
 . "$_secrets_file"

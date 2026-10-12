@@ -24,6 +24,7 @@ type Config struct {
 	JWTPreviousKeys   []ed25519.PublicKey // still accepted, still published in JWKS
 	DataEncryptionKey string              // base64, 32 bytes (validated by the keyring)
 	AdminToken        string
+	NodeAgentSecret   string // optional: derives per-node agent tokens
 	BillingSecret     string
 	ProberSecret      string
 	TrustedProxies    []netip.Prefix
@@ -90,6 +91,7 @@ func Load(getenv func(string) string) (Config, error) {
 		DatabaseURL:     getenv("DATABASE_URL"),
 		RedisURL:        getenv("REDIS_URL"),
 		AdminToken:      getenv("ADMIN_TOKEN"),
+		NodeAgentSecret: getenv("NODE_AGENT_SECRET"),
 		BillingSecret:   getenv("BILLING_SERVICE_SECRET"),
 		ProberSecret:    getenv("PROBER_SERVICE_SECRET"),
 		LogLevel:        def(getenv("LOG_LEVEL"), "info"),
@@ -114,6 +116,12 @@ func Load(getenv func(string) string) (Config, error) {
 	req("ADMIN_TOKEN", c.AdminToken, 32)
 	req("BILLING_SERVICE_SECRET", c.BillingSecret, 32)
 	req("PROBER_SERVICE_SECRET", c.ProberSecret, 32)
+	if c.NodeAgentSecret != "" && len(c.NodeAgentSecret) < 32 {
+		errs = append(errs, errors.New("NODE_AGENT_SECRET must be at least 32 characters"))
+	}
+	if c.NodeAgentSecret != "" && c.NodeAgentSecret == c.AdminToken {
+		errs = append(errs, errors.New("NODE_AGENT_SECRET must differ from ADMIN_TOKEN"))
+	}
 
 	if v := getenv("JWT_SIGNING_KEY"); v == "" {
 		errs = append(errs, errors.New("JWT_SIGNING_KEY is required (base64 32-byte Ed25519 seed)"))
