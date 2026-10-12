@@ -100,3 +100,23 @@ services:
     command: ["python", "/app/fake_node.py", "--host", "0.0.0.0", "--wg-port", "51820", "--ss-port", "8443", "--load", "0.75", "--delay-ms", "35", "--drop", "0.2"]
     volumes: ["./services/fleet-prober/tools/fake_node.py:/app/fake_node.py:ro"]
     networks: { slipstream: { ipv4_address: 172.28.0.11 } }
+
+  # Node agent for one registered server, in dry-run (logs peer changes instead
+  # of calling wg). Register a server first, then put its id and agent_token in
+  # .env as NODE_SERVER_ID / NODE_AGENT_TOKEN and run:
+  #   docker compose --profile agent up node-agent
+  node-agent:
+    profiles: [agent]
+    build: { context: ., dockerfile: Dockerfile.node-agent }
+    command: ["-dry-run"]
+    environment:
+      API_URL: http://api:8080
+      SERVER_ID: ${NODE_SERVER_ID:-}
+      AGENT_TOKEN: ${NODE_AGENT_TOKEN:-}
+      SYNC_INTERVAL: 5s
+      PEER_CAPACITY: "1000"
+      ECHO_ADDR: ":51821"
+      HTTP_ADDR: ":9100"
+    tmpfs: ["/run/psk:mode=0700"]
+    depends_on: [api]
+    networks: [slipstream]

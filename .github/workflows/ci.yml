@@ -62,5 +62,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -f Dockerfile.api -t slipstream-api .
+      - run: docker build -f Dockerfile.node-agent -t slipstream-node-agent .
       - run: docker build -t slipstream-billing services/billing-webhooks
       - run: docker build -t slipstream-prober services/fleet-prober

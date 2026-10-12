@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+# Slipstream node agent: runs on every VPN node. Build from the repo root:
+#   docker build -f Dockerfile.node-agent -t slipstream-node-agent .
+#
+# On a real node run it with host networking and CAP_NET_ADMIN so wg(8) can
+# manage the WireGuard interface:
+#   docker run --network host --cap-add NET_ADMIN \
+#     -e API_URL=... -e SERVER_ID=... -e AGENT_TOKEN=... slipstream-node-agent
+
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+ENV CGO_ENABLED=0 GOOS=linux GOFLAGS=-trimpath
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY api/ api/
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY migrations/ migrations/
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    go build -ldflags="-s -w" -o /out/node-agent ./cmd/node-agent
+
+# Alpine rather than distroless: the agent shells out to wg(8) from
+# wireguard-tools. Preshared keys are written to PSK_DIR for the life of one
+# wg call; mount a tmpfs there so they never touch disk.
+FROM alpine:3.20
+RUN apk add --no-cache wireguard-tools ca-certificates && mkdir -p /run/psk && chmod 700 /run/psk
+COPY --from=build /out/node-agent /usr/local/bin/node-agent
+ENV PSK_DIR=/run/psk
+EXPOSE 9100 51821/udp
+ENTRYPOINT ["/usr/local/bin/node-agent"]
